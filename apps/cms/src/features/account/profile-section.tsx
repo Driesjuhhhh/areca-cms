@@ -3,39 +3,34 @@ import { useRouter } from '@tanstack/react-router'
 import { toast } from 'sonner'
 
 import { Button } from '#/components/ui/button'
-import { FormField } from '#/components/ui/form-field'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '#/components/ui/dialog'
 import { Input } from '#/components/ui/input'
 import { Label } from '#/components/ui/label'
 import { SettingsSection } from '#/components/ui/settings-section'
-import { PasswordInput } from '#/features/auth/password-input'
-import { authClient } from '#/lib/auth-client'
 import { PERSON_NAME_MAX_LENGTH } from '#/lib/person-name'
+import type { ReauthProvider } from '#/lib/reauth-provider'
 import { m } from '#/paraglide/messages'
 import { updateMyNameFn } from '#/server/fn/account'
-import { verifyStepUpFn } from '#/server/fn/security'
 import type { Me } from '#/server/fn/me'
 
 import { canSaveName } from './account-logic'
+import { ProfileEmail } from './profile-email'
 
 /**
  * Profile: the display name is editable (Enter saves, Escape reverts). The
- * email is read-only, except that agency admins can ask for a change, which
- * only applies once the new address confirms it. Saving refreshes the router, which drops the cached
- * `me`, so the navbar account menu shows the new name without a reload.
+ * email is shown read-only; agency admins can ask to change it
+ * (`ProfileEmail`). Saving the name refreshes the router, which drops the
+ * cached `me`, so the navbar account menu shows the new name without a reload.
  */
 export function ProfileSection({
   me,
   hasPassword,
+  reauth,
+  mailConfigured,
 }: {
   me: Me
   hasPassword: boolean
+  reauth: ReauthProvider | null
+  mailConfigured: boolean
 }) {
   const router = useRouter()
   const [saved, setSaved] = React.useState(me.user.name)
@@ -63,60 +58,6 @@ export function ProfileSection({
     } finally {
       setPending(false)
     }
-  }
-
-  const [newEmail, setNewEmail] = React.useState('')
-  const [emailPassword, setEmailPassword] = React.useState('')
-  const [emailCode, setEmailCode] = React.useState('')
-  const [codeOpen, setCodeOpen] = React.useState(false)
-  const [emailPending, setEmailPending] = React.useState(false)
-  const [emailError, setEmailError] = React.useState<string | null>(null)
-  const [codeError, setCodeError] = React.useState<string | null>(null)
-
-  // With two-factor on, the code is asked in a dialog after this click.
-  function startEmailChange(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (me.user.twoFactorEnabled) {
-      setCodeError(null)
-      setCodeOpen(true)
-    } else {
-      void changeEmail()
-    }
-  }
-
-  async function changeEmail() {
-    setEmailPending(true)
-    setEmailError(null)
-    setCodeError(null)
-    if (me.user.twoFactorEnabled) {
-      try {
-        await verifyStepUpFn({
-          data: { code: emailCode.replace(/\s+/g, ''), kind: 'totp' },
-        })
-      } catch (failure) {
-        setEmailPending(false)
-        setCodeError(
-          failure instanceof Error ? failure.message : m.account_email_failed(),
-        )
-        return
-      }
-    }
-    const body = {
-      newEmail: newEmail.trim(),
-      callbackURL: '/account',
-      currentPassword: emailPassword,
-    }
-    const result = await authClient.changeEmail(body)
-    setEmailPending(false)
-    setCodeOpen(false)
-    if (result.error) {
-      setEmailError(result.error.message ?? m.account_email_failed())
-      return
-    }
-    toast.success(m.account_email_sent({ email: body.newEmail }))
-    setNewEmail('')
-    setEmailPassword('')
-    setEmailCode('')
   }
 
   return (
@@ -174,149 +115,12 @@ export function ProfileSection({
           </p>
         ) : null}
       </form>
-      <FormField
-        label={m.auth_email()}
-        htmlFor="account-email"
-        hint={me.user.isAgencyAdmin ? undefined : m.account_email_note()}
-      >
-        <Input
-          id="account-email"
-          name="email"
-          value={me.user.email}
-          readOnly
-          data-testid="account-email"
-          className="text-text-secondary"
-        />
-      </FormField>
-      {me.user.isAgencyAdmin ? (
-        <form
-          className="grid gap-4"
-          data-testid="account-email-form"
-          onSubmit={startEmailChange}
-        >
-          <FormField label={m.account_email_new()} htmlFor="account-new-email">
-            <Input
-              id="account-new-email"
-              name="newEmail"
-              type="email"
-              autoComplete="email"
-              required
-              value={newEmail}
-              disabled={emailPending}
-              onChange={(event) => {
-                setNewEmail(event.target.value)
-                setEmailError(null)
-              }}
-            />
-          </FormField>
-          {hasPassword ? (
-            <FormField
-              label={m.account_email_password()}
-              htmlFor="account-email-password"
-            >
-              <PasswordInput
-                id="account-email-password"
-                name="currentPassword"
-                autoComplete="current-password"
-                required
-                value={emailPassword}
-                disabled={emailPending}
-                onChange={(event) => {
-                  setEmailPassword(event.target.value)
-                  setEmailError(null)
-                }}
-              />
-            </FormField>
-          ) : null}
-          {emailError ? (
-            <p role="alert" className="text-callout text-text-error">
-              {emailError}
-            </p>
-          ) : null}
-          <div>
-            <Button
-              type="submit"
-              variant="secondary"
-              loading={emailPending}
-              disabled={!newEmail.trim()}
-              data-testid="account-email-submit"
-              className="w-full sm:w-auto"
-            >
-              {m.account_email_change()}
-            </Button>
-          </div>
-        </form>
-      ) : null}
-      <Dialog
-        open={codeOpen}
-        onOpenChange={(open) => {
-          if (emailPending) return
-          setCodeOpen(open)
-          if (!open) setEmailCode('')
-        }}
-      >
-        <DialogContent size="sm">
-          <form
-            className="grid gap-4"
-            data-testid="account-email-code-form"
-            onSubmit={(event) => {
-              event.preventDefault()
-              void changeEmail()
-            }}
-          >
-            <DialogHeader>
-              <DialogTitle>{m.account_email_code_title()}</DialogTitle>
-              <DialogDescription>
-                {m.account_email_code_description()}
-              </DialogDescription>
-            </DialogHeader>
-            <FormField
-              label={m.auth_two_factor_code()}
-              htmlFor="account-email-code"
-              hint={m.auth_two_factor_code_hint()}
-              error={codeError ?? undefined}
-            >
-              <Input
-                id="account-email-code"
-                name="code"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                spellCheck={false}
-                autoFocus
-                value={emailCode}
-                disabled={emailPending}
-                data-testid="account-email-code"
-                onChange={(event) => {
-                  setEmailCode(event.target.value)
-                  setCodeError(null)
-                }}
-              />
-            </FormField>
-            <div className="flex justify-end gap-2">
-              <Button
-                type="button"
-                variant="quiet"
-                disabled={emailPending}
-                onClick={() => {
-                  setCodeOpen(false)
-                  setEmailCode('')
-                }}
-              >
-                {m.shared_cancel()}
-              </Button>
-              <Button
-                type="submit"
-                variant="primary"
-                loading={emailPending}
-                disabled={!emailCode.trim()}
-                data-testid="account-email-code-submit"
-              >
-                {m.account_email_change()}
-              </Button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
+      <ProfileEmail
+        me={me}
+        hasPassword={hasPassword}
+        reauth={reauth}
+        mailConfigured={mailConfigured}
+      />
     </SettingsSection>
   )
 }

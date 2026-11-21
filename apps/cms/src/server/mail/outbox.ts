@@ -53,6 +53,7 @@ export type MailTemplate =
   | 'verify_email'
   | 'email_change_verify'
   | 'email_change_notice'
+  | 'email_changed'
   | 'password_changed'
   | 'two_factor_enabled'
   | 'two_factor_disabled'

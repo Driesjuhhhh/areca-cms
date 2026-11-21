@@ -41,6 +41,7 @@ const RENDERERS: Record<MailTemplate, Renderer> = {
   verify_email: verifyEmail.render,
   email_change_verify: emailChange.renderVerify,
   email_change_notice: emailChange.renderNotice,
+  email_changed: emailChange.renderChanged,
   password_changed: passwordChanged.render,
   two_factor_enabled: twoFactor.renderEnabled,
   two_factor_disabled: twoFactor.renderDisabled,

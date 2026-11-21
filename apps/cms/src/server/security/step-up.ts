@@ -104,6 +104,16 @@ export async function hasRecentStepUp(
   return isFresh([marker?.createdAt], now, windowMs)
 }
 
+/**
+ * Uses up this session's re-verification, so the next sensitive action asks
+ * for a new code. Called after an action that needs a code of its own.
+ */
+export async function consumeStepUp(sessionId: string) {
+  await db
+    .delete(verification)
+    .where(eq(verification.identifier, markerId(sessionId)))
+}
+
 async function failureCount(userId: string, now: Date) {
   const row = (
     await db

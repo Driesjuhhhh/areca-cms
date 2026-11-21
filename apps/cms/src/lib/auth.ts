@@ -4,9 +4,11 @@ import {
   oauthProvider,
 } from '@better-auth/oauth-provider'
 import { betterAuth } from 'better-auth'
+import type { GenericEndpointContext } from 'better-auth'
 import {
   APIError,
   createAuthMiddleware,
+  getAuthoritativeSessionFromCtx,
   getSessionFromCtx,
   isAPIError,
 } from 'better-auth/api'
@@ -22,7 +24,16 @@ import { m } from '#/paraglide/messages'
 import { handleLocalFactorRequest } from '#/server/security/factor-http'
 import { MfaRequiredError, REAUTH_REQUIRED } from '#/lib/security-errors'
 import { isFresh } from '#/lib/step-up'
-import { hasRecentStepUp } from '#/server/security/step-up'
+import { consumeStepUp, hasRecentStepUp } from '#/server/security/step-up'
+import {
+  EMAIL_CHANGE_CALLBACK,
+  cancelPendingEmailChange,
+  emailChangeRefusal,
+  emailChangeTarget,
+  finishEmailChange,
+  recordPendingEmailChange,
+} from '#/server/security/email-change'
+import { isMailConfigured } from '#/server/mail/config'
 import { allowKeyedAction } from '#/server/http/rate-limit-store.server'
 import { getClientIp } from '#/server/http/rate-limit'
 import {
@@ -144,32 +155,69 @@ async function assertMailRequestBudget(
   if (!allowed) throw new APIError('TOO_MANY_REQUESTS', { code, message })
 }
 
+// Every try counts, also a wrong password, so guesses are limited too.
+const EMAIL_CHANGE_ATTEMPT_RULE = { limit: 10, windowSeconds: 60 * 60 } as const
+
+/** A passwordless account without two-factor must sign in again first. */
+export const EMAIL_CHANGE_SIGN_IN_AGAIN = 'SIGN_IN_AGAIN'
+
 /**
  * Changing the sign-in address is limited to agency admins (a Starter account
- * is its own agency) and needs the same proof as other sensitive changes: the
- * password, or a recent sign-in when there is none, plus a local code when
- * two-factor is on. The new address still has to confirm by link.
+ * is its own agency). Checked in this order, against the database rather than
+ * the session cookie cache:
+ *
+ * 1. an unblocked agency admin, a different address, and mail that can
+ *    deliver the confirmation link;
+ * 2. the admin two-factor policy: an admin who still has to enrol cannot;
+ * 3. an attempt budget per person, taken before the password is checked;
+ * 4. the current password, or for an account without one a recent sign-in
+ *    (or, with two-factor on, the code below);
+ * 5. with two-factor on, a code typed for this change. `REAUTH_REQUIRED`
+ *    makes `useStepUp` ask for it and retry; the code is used up on success;
+ * 6. at most three confirmation mails per hour.
+ *
+ * The new address still has to confirm by link (`emailChangeRefusal`).
  */
-async function assertMayChangeEmail(
-  ctx: AuthContext,
-  session: NonNullable<Awaited<ReturnType<typeof getSessionFromCtx>>>,
-) {
-  if (!session.user.isAgencyAdmin) {
+async function assertMayChangeEmail(ctx: AuthContext) {
+  const session = await getAuthoritativeSessionFromCtx(ctx)
+  // Without a session Better Auth answers 401 itself.
+  if (!session) return
+  if (!session.user.isAgencyAdmin || session.user.blockedAt) {
     throw new APIError('FORBIDDEN', {
       code: 'EMAIL_CHANGE_NOT_ALLOWED',
       message: m.server_email_change_forbidden(),
     })
   }
-  if (session.user.twoFactorEnabled) {
-    await assertAuthLocalMfa(session, requireLocalMfa)
-    // A code typed for this change, not only the one from signing in.
-    if (!(await hasRecentStepUp(session.session.id))) {
-      throw new APIError('FORBIDDEN', {
-        code: 'MFA_REQUIRED',
-        message: m.server_email_change_code_required(),
-      })
-    }
+  const newEmail =
+    isRecord(ctx.body) && typeof ctx.body.newEmail === 'string'
+      ? ctx.body.newEmail.trim().toLowerCase()
+      : ''
+  if (newEmail === session.user.email.toLowerCase()) {
+    throw new APIError('BAD_REQUEST', {
+      code: 'EMAIL_CHANGE_SAME',
+      message: m.server_email_change_same(),
+    })
   }
+  if (!(await isMailConfigured())) {
+    throw new APIError('BAD_REQUEST', {
+      code: 'EMAIL_CHANGE_MAIL_UNAVAILABLE',
+      message: m.server_email_change_mail_unavailable(),
+    })
+  }
+  await assertAuthLocalMfa(session, requireLocalMfa)
+  if (
+    !(await allowKeyedAction(
+      'change-email-attempt',
+      session.user.id,
+      EMAIL_CHANGE_ATTEMPT_RULE,
+    ))
+  ) {
+    throw new APIError('TOO_MANY_REQUESTS', {
+      code: 'EMAIL_CHANGE_RATE_LIMITED',
+      message: m.server_email_change_rate_limited(),
+    })
+  }
+  const hasTwoFactor = Boolean(session.user.twoFactorEnabled)
   const credential = await ctx.context.internalAdapter.findCredentialAccount(
     session.user.id,
   )
@@ -187,10 +235,16 @@ async function assertMayChangeEmail(
         message: m.server_email_change_wrong_password(),
       })
     }
-  } else if (!isFresh([session.session.createdAt])) {
+  } else if (!hasTwoFactor && !isFresh([session.session.createdAt])) {
+    throw new APIError('FORBIDDEN', {
+      code: EMAIL_CHANGE_SIGN_IN_AGAIN,
+      message: m.server_email_change_reauth(),
+    })
+  }
+  if (hasTwoFactor && !(await hasRecentStepUp(session.session.id))) {
     throw new APIError('FORBIDDEN', {
       code: REAUTH_REQUIRED,
-      message: `${REAUTH_REQUIRED}: ${m.server_email_change_reauth()}`,
+      message: `${REAUTH_REQUIRED}: ${m.server_email_change_code_required()}`,
     })
   }
   if (
@@ -205,6 +259,85 @@ async function assertMayChangeEmail(
       message: m.server_verification_email_rate_limited(),
     })
   }
+}
+
+/**
+ * Email changes confirmed by link, between the user update (`before`, which
+ * knows the old address) and its commit (`after`, which announces it).
+ */
+const pendingEmailMoves = new Map<
+  string,
+  { from: string; to: string; keepSessionId: string | null }
+>()
+
+/**
+ * Opening an email change link. Better Auth has checked the token; this also
+ * needs the change to still be the pending one, the person to still be an
+ * unblocked agency admin, and the address to be free. Otherwise the link
+ * returns to the account page with `error=<code>`. Opening the link proves
+ * the new address, so it counts as verified.
+ */
+async function stageEmailMove(
+  data: Record<string, unknown>,
+  email: string,
+  ctx: GenericEndpointContext,
+) {
+  const target = await emailChangeTarget(
+    isRecord(ctx.query) ? ctx.query.token : undefined,
+  )
+  const refusal = target
+    ? await emailChangeRefusal(target.userId, email)
+    : 'EMAIL_CHANGE_CANCELLED'
+  if (!target || refusal) {
+    throw ctx.redirect(
+      `${EMAIL_CHANGE_CALLBACK}&error=${encodeURIComponent(refusal ?? 'INVALID_TOKEN')}`,
+    )
+  }
+  const [row] = await db
+    .select({ email: schema.user.email })
+    .from(schema.user)
+    .where(eq(schema.user.id, target.userId))
+    .limit(1)
+  const opener = await getSessionFromCtx(ctx)
+  pendingEmailMoves.set(target.userId, {
+    // The lookup can come back empty, so the row check stays.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    from: row?.email ?? '',
+    to: email.toLowerCase(),
+    keepSessionId: opener?.user.id === target.userId ? opener.session.id : null,
+  })
+  return { ...data, email: email.toLowerCase(), emailVerified: true }
+}
+
+/**
+ * After a confirmed change: other sessions end, links mailed to the old
+ * address stop working, the change is audited and the old address is told.
+ */
+async function announceEmailMove(updated: { id: string; email: string }) {
+  const move = pendingEmailMoves.get(updated.id)
+  if (!move) return
+  pendingEmailMoves.delete(updated.id)
+  if (updated.email.toLowerCase() !== move.to) return
+  await finishEmailChange(updated.id, move.keepSessionId)
+  await auditAuthEvent({
+    action: 'user.email_change',
+    userId: updated.id,
+    sessionId: move.keepSessionId,
+    meta: { previousEmail: move.from, newEmail: move.to },
+  })
+  if (!move.from) return
+  await sendQuietly('email changed notice', () =>
+    sendAccountEmail({
+      kind: 'email_changed',
+      userId: updated.id,
+      to: move.from,
+      params: {
+        userId: updated.id,
+        newEmail: move.to,
+        at: new Date().toISOString(),
+      },
+    }),
+  )
 }
 
 type AuthEvent = {
@@ -350,6 +483,7 @@ const authBase = betterAuth({
       )
     },
     onPasswordReset: async ({ user }) => {
+      await cancelPendingEmailChange(user.id)
       await auditAuthEvent({ action: 'user.password_reset', userId: user.id })
       await sendQuietly('password changed email', () =>
         sendAccountEmail({
@@ -363,8 +497,10 @@ const authBase = betterAuth({
   emailVerification: {
     sendOnSignUp: false,
     expiresIn: 60 * 60 * 24,
-    sendVerificationEmail: async ({ user, url }) => {
-      // An email change passes the new address here, before it is stored.
+    sendVerificationEmail: async ({ user }) => {
+      // `/change-email` passes the new address here, before it is stored.
+      // Better Auth's link is not used: the template derives one from the
+      // pending change, so a retried send still works.
       const stored = (
         await db
           .select({ email: schema.user.email })
@@ -373,8 +509,9 @@ const authBase = betterAuth({
           .limit(1)
       ).at(0)
       if (stored && stored.email.toLowerCase() !== user.email.toLowerCase()) {
+        await recordPendingEmailChange(user.id, user.email)
         await sendQuietly('email change link', () =>
-          sendEmailChangeLink({ userId: user.id, to: user.email, url }),
+          sendEmailChangeLink({ userId: user.id, newEmail: user.email }),
         )
         return
       }
@@ -454,6 +591,9 @@ const authBase = betterAuth({
       },
       update: {
         before: async (data, ctx) => {
+          if (ctx?.path === '/verify-email' && typeof data.email === 'string') {
+            return { data: await stageEmailMove(data, data.email, ctx) }
+          }
           if (typeof data.twoFactorEnabled !== 'boolean') return
           // Two-factor is only changed by the signed-in user, so the session
           // names the row. Without one, no notice is sent.
@@ -471,6 +611,7 @@ const authBase = betterAuth({
           }
         },
         after: async (updated) => {
+          await announceEmailMove(updated)
           const enabled = pendingTwoFactorChanges.get(updated.id)
           if (enabled === undefined) return
           pendingTwoFactorChanges.delete(updated.id)
@@ -594,8 +735,7 @@ const authBase = betterAuth({
         )
       }
       if (ctx.path === '/change-email') {
-        const session = await getSessionFromCtx(ctx)
-        if (session) await assertMayChangeEmail(ctx, session)
+        await assertMayChangeEmail(ctx)
       }
       if (ctx.path === '/sign-out') {
         const session = await getSessionFromCtx(ctx)
@@ -640,6 +780,8 @@ const authBase = betterAuth({
         if (isAPIError(result) || !isRecord(result)) return
         if (!isRecord(result.user) || typeof result.user.id !== 'string') return
         const userId = result.user.id
+        // A new password also cancels a pending email change (see the notice).
+        await cancelPendingEmailChange(userId)
         await auditAuthEvent({
           action: 'user.password_change',
           userId,
@@ -662,6 +804,8 @@ const authBase = betterAuth({
           isRecord(ctx.body) && typeof ctx.body.newEmail === 'string'
             ? ctx.body.newEmail.trim().toLowerCase()
             : null
+        // The code was typed for this request; the next one asks again.
+        await consumeStepUp(session.session.id)
         await auditAuthEvent({
           action: 'user.email_change_request',
           userId: session.user.id,
