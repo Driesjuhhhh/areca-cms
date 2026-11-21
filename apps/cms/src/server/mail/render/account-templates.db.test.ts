@@ -140,6 +140,8 @@ describe.skipIf(!hasDb)('account email templates', () => {
       const params: Record<string, unknown> = {
         userId: fx.person.id,
         token: 'tok-abc',
+        url: 'https://cms.test/verify',
+        newEmail: 'new@example.com',
         providers: ['Microsoft'],
         at: '2026-10-21T10:00:00Z',
         orgName: 'Northbound',
