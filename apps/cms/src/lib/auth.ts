@@ -20,12 +20,15 @@ import * as schema from '#/db/schema'
 import { env } from '#/env'
 import { m } from '#/paraglide/messages'
 import { handleLocalFactorRequest } from '#/server/security/factor-http'
-import { MfaRequiredError } from '#/lib/security-errors'
+import { MfaRequiredError, REAUTH_REQUIRED } from '#/lib/security-errors'
+import { isFresh } from '#/lib/step-up'
+import { hasRecentStepUp } from '#/server/security/step-up'
 import { allowKeyedAction } from '#/server/http/rate-limit-store.server'
 import { getClientIp } from '#/server/http/rate-limit'
 import {
   deliverPasswordReset,
   sendAccountEmail,
+  sendEmailChangeLink,
   sendVerificationEmail,
 } from '#/server/mail/account-emails'
 import { audit } from '#/server/audit'
@@ -96,6 +99,8 @@ async function assertAuthLocalMfa(
   }
 }
 
+type AuthContext = Parameters<Parameters<typeof createAuthMiddleware>[0]>[0]
+
 const authLog = createLogger('auth')
 
 /**
@@ -137,6 +142,69 @@ async function assertMailRequestBudget(
     (!email || (await allowKeyedAction(`${scope}-email`, email, rule))) &&
     (ip === 'unknown' || (await allowKeyedAction(`${scope}-ip`, ip, rule)))
   if (!allowed) throw new APIError('TOO_MANY_REQUESTS', { code, message })
+}
+
+/**
+ * Changing the sign-in address is limited to agency admins (a Starter account
+ * is its own agency) and needs the same proof as other sensitive changes: the
+ * password, or a recent sign-in when there is none, plus a local code when
+ * two-factor is on. The new address still has to confirm by link.
+ */
+async function assertMayChangeEmail(
+  ctx: AuthContext,
+  session: NonNullable<Awaited<ReturnType<typeof getSessionFromCtx>>>,
+) {
+  if (!session.user.isAgencyAdmin) {
+    throw new APIError('FORBIDDEN', {
+      code: 'EMAIL_CHANGE_NOT_ALLOWED',
+      message: m.server_email_change_forbidden(),
+    })
+  }
+  if (session.user.twoFactorEnabled) {
+    await assertAuthLocalMfa(session, requireLocalMfa)
+    // A code typed for this change, not only the one from signing in.
+    if (!(await hasRecentStepUp(session.session.id))) {
+      throw new APIError('FORBIDDEN', {
+        code: 'MFA_REQUIRED',
+        message: m.server_email_change_code_required(),
+      })
+    }
+  }
+  const credential = await ctx.context.internalAdapter.findCredentialAccount(
+    session.user.id,
+  )
+  if (credential?.password) {
+    const password = isRecord(ctx.body) ? ctx.body.currentPassword : undefined
+    const valid =
+      typeof password === 'string' &&
+      (await ctx.context.password.verify({
+        hash: credential.password,
+        password,
+      }))
+    if (!valid) {
+      throw new APIError('BAD_REQUEST', {
+        code: 'INVALID_PASSWORD',
+        message: m.server_email_change_wrong_password(),
+      })
+    }
+  } else if (!isFresh([session.session.createdAt])) {
+    throw new APIError('FORBIDDEN', {
+      code: REAUTH_REQUIRED,
+      message: `${REAUTH_REQUIRED}: ${m.server_email_change_reauth()}`,
+    })
+  }
+  if (
+    !(await allowKeyedAction(
+      'change-email-user',
+      session.user.id,
+      VERIFY_REQUEST_RULE,
+    ))
+  ) {
+    throw new APIError('TOO_MANY_REQUESTS', {
+      code: 'EMAIL_CHANGE_RATE_LIMITED',
+      message: m.server_verification_email_rate_limited(),
+    })
+  }
 }
 
 type AuthEvent = {
@@ -295,7 +363,21 @@ const authBase = betterAuth({
   emailVerification: {
     sendOnSignUp: false,
     expiresIn: 60 * 60 * 24,
-    sendVerificationEmail: async ({ user }) => {
+    sendVerificationEmail: async ({ user, url }) => {
+      // An email change passes the new address here, before it is stored.
+      const stored = (
+        await db
+          .select({ email: schema.user.email })
+          .from(schema.user)
+          .where(eq(schema.user.id, user.id))
+          .limit(1)
+      ).at(0)
+      if (stored && stored.email.toLowerCase() !== user.email.toLowerCase()) {
+        await sendQuietly('email change link', () =>
+          sendEmailChangeLink({ userId: user.id, to: user.email, url }),
+        )
+        return
+      }
       await sendQuietly('verification email', () =>
         sendVerificationEmail(user.id),
       )
@@ -411,6 +493,7 @@ const authBase = betterAuth({
     },
   },
   user: {
+    changeEmail: { enabled: true },
     additionalFields: {
       isAgencyAdmin: {
         type: 'boolean',
@@ -510,6 +593,10 @@ const authBase = betterAuth({
           m.server_verification_email_rate_limited(),
         )
       }
+      if (ctx.path === '/change-email') {
+        const session = await getSessionFromCtx(ctx)
+        if (session) await assertMayChangeEmail(ctx, session)
+      }
       if (ctx.path === '/sign-out') {
         const session = await getSessionFromCtx(ctx)
         if (session) {
@@ -564,6 +651,35 @@ const authBase = betterAuth({
             kind: 'password_changed',
             userId,
             params: { userId, at: new Date().toISOString() },
+          }),
+        )
+        return
+      }
+      if (ctx.path === '/change-email') {
+        const session = ctx.context.session
+        if (!session || isAPIError(ctx.context.returned)) return
+        const newEmail =
+          isRecord(ctx.body) && typeof ctx.body.newEmail === 'string'
+            ? ctx.body.newEmail.trim().toLowerCase()
+            : null
+        await auditAuthEvent({
+          action: 'user.email_change_request',
+          userId: session.user.id,
+          sessionId: session.session.id,
+          request: ctx.request,
+          meta: { newEmail },
+        })
+        // Goes to the address on the account now, so a hijacked session
+        // cannot move the account quietly.
+        await sendQuietly('email change notice', () =>
+          sendAccountEmail({
+            kind: 'email_change_notice',
+            userId: session.user.id,
+            params: {
+              userId: session.user.id,
+              newEmail,
+              at: new Date().toISOString(),
+            },
           }),
         )
         return

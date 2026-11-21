@@ -79,6 +79,31 @@ export async function recordStepUp(
   })
 }
 
+/**
+ * True when this session entered a code itself (`recordStepUp`) within
+ * `windowMs`. Unlike `assertFreshSession`, a recent sign-in does not count:
+ * the person has to type a code for this action.
+ */
+export async function hasRecentStepUp(
+  sessionId: string,
+  windowMs: number = 2 * 60 * 1000,
+  now: Date = new Date(),
+) {
+  const marker = (
+    await db
+      .select({ createdAt: verification.createdAt })
+      .from(verification)
+      .where(
+        and(
+          eq(verification.identifier, markerId(sessionId)),
+          gt(verification.expiresAt, now),
+        ),
+      )
+      .limit(1)
+  ).at(0)
+  return isFresh([marker?.createdAt], now, windowMs)
+}
+
 async function failureCount(userId: string, now: Date) {
   const row = (
     await db

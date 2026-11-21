@@ -69,6 +69,18 @@ describe.skipIf(!hasDb)('account email templates', () => {
           ],
           ['verify_email', { userId: unverified.person.id }],
           [
+            'email_change_verify',
+            { userId: unverified.person.id, url: 'https://cms.test/verify' },
+          ],
+          [
+            'email_change_notice',
+            {
+              userId: unverified.person.id,
+              newEmail: 'new@example.com',
+              at: '2026-10-21T10:00:00Z',
+            },
+          ],
+          [
             'password_changed',
             { userId: unverified.person.id, at: '2026-10-21T10:00:00Z' },
           ],
@@ -115,6 +127,8 @@ describe.skipIf(!hasDb)('account email templates', () => {
     'password_reset',
     'password_reset_sso',
     'verify_email',
+    'email_change_verify',
+    'email_change_notice',
     'password_changed',
     'two_factor_enabled',
     'two_factor_disabled',

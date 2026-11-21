@@ -31,6 +31,7 @@ export type AccountEmailKind =
   | 'password_reset'
   | 'password_reset_sso'
   | 'verify_email'
+  | 'email_change_notice'
   | 'password_changed'
   | 'two_factor_enabled'
   | 'two_factor_disabled'
@@ -205,6 +206,40 @@ export async function sendVerificationEmail(
   })
   if (!queued) return null
   return sendNow(queued.id, { claimedAttempt: queued.claimedAttempt })
+}
+
+/**
+ * Confirmation link for a new address, sent to that address (not the one on
+ * the account). The link is passed to the send only and never stored.
+ */
+export async function sendEmailChangeLink(input: {
+  userId: string
+  to: string
+  url: string
+}): Promise<SendResult | null> {
+  if (!(await isMailConfigured())) return null
+  const locale = (
+    await db
+      .select({ locale: user.locale })
+      .from(user)
+      .where(eq(user.id, input.userId))
+      .limit(1)
+  ).at(0)?.locale
+  const renderParams = { url: input.url }
+  const queued = await enqueueEmail({
+    kind: 'email_change_verify',
+    template: 'email_change_verify',
+    to: input.to,
+    params: { userId: input.userId },
+    renderParams,
+    locale: mailLocale(locale),
+    userId: input.userId,
+    immediate: true,
+  })
+  return sendNow(queued.id, {
+    renderParams,
+    claimedAttempt: queued.claimedAttempt,
+  })
 }
 
 /** Removes a reset token, so a link that was never sent cannot be used. */

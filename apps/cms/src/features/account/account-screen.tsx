@@ -123,7 +123,7 @@ export function AccountScreen({
         </div>
       ) : null}
 
-      <ProfileSection me={me} />
+      <ProfileSection me={me} hasPassword={hasPassword} />
 
       {hasPassword ? <PasswordSection /> : null}
 

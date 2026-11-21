@@ -51,6 +51,8 @@ export type MailTemplate =
   | 'password_reset'
   | 'password_reset_sso'
   | 'verify_email'
+  | 'email_change_verify'
+  | 'email_change_notice'
   | 'password_changed'
   | 'two_factor_enabled'
   | 'two_factor_disabled'
